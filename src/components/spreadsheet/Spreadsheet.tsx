@@ -318,11 +318,18 @@ export default function Spreadsheet() {
                           aria-label={`Edit ${address}`}
                         />
                       ) : (
-                        <span className="truncate block">
-                          {cell?.value === null
+                      <span
+                        className={`truncate block ${
+                          cell?.error ? "text-red-600 font-semibold" : ""
+                        }`}
+                        title={cell?.error || undefined}
+                      >
+                        {cell?.error
+                          ? cell.error
+                          : cell?.value === null
                             ? ""
                             : cell?.value ?? ""}
-                        </span>
+                      </span>
                       )}
                     </div>
                   );
