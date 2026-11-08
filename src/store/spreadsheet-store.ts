@@ -6,9 +6,17 @@ import { getCellAddress, parseCellAddress } from "@/lib/spreadsheet-utils";
 interface SpreadsheetActions {
   setActiveCell: (address: string) => void;
   updateCell: (address: string, raw: string) => void;
+  pasteCells: (startAddress: string, matrix: string[][]) => void;
   addSheet: () => void;
   renameSheet: (id: string, name: string) => void;
   setActiveSheet: (id: string) => void;
+  undo: () => void;
+  redo: () => void;
+}
+
+interface HistoryState {
+  past: Sheet[][];
+  future: Sheet[][];
 }
 
 type FormulaArgument = number | number[];
@@ -85,12 +93,12 @@ function calculateCells(
     visiting.add(normalized);
 
     try {
-const value = evaluateFormula(
-  raw.slice(1),
-  getNumericValue,
-  getRangeValues,
-  cells
-);
+      const value = evaluateFormula(
+        raw.slice(1),
+        getNumericValue,
+        getRangeValues,
+        cells
+      );
 
       const result: Cell = {
         raw: original.raw,
@@ -156,7 +164,6 @@ const value = evaluateFormula(
       for (let col = minCol; col <= maxCol; col++) {
         const address = getCellAddress(row, col);
         const value = getNumericValue(address, true);
-
         const cell = getCell(address);
 
         if (typeof cell.value === "number") {
@@ -182,6 +189,7 @@ function evaluateFormula(
   cells: Record<string, Cell>
 ): number {
   const tokens: string[] = [];
+
   const pattern =
     /\s*(?:(\d+(?:\.\d*)?|\.\d+)|([A-Za-z]+\d+)|([A-Za-z]+)|([()+\-*/^,:]))/y;
 
@@ -342,8 +350,10 @@ function evaluateFormula(
       if (functionName === "AVG") {
         if (numbers.length === 0) throw new Error("#DIV/0!");
 
-        return numbers.reduce((sum, value) => sum + value, 0) /
-          numbers.length;
+        return (
+          numbers.reduce((sum, value) => sum + value, 0) /
+          numbers.length
+        );
       }
 
       throw new Error("#NAME?");
@@ -352,12 +362,13 @@ function evaluateFormula(
     throw new Error("#ERROR!");
   }
 
-  // Helper used by aggregate functions to distinguish text from numbers.
   function getCellForFunction(address: string): Cell {
-    return cells[ address.toUpperCase() ] || {
-      raw: "",
-      value: null,
-    };
+    return (
+      cells[address.toUpperCase()] || {
+        raw: "",
+        value: null,
+      }
+    );
   }
 
   const result = expression();
@@ -370,11 +381,15 @@ function evaluateFormula(
 }
 
 export const useSpreadsheetStore = create<
-  SpreadsheetState & SpreadsheetActions
+  SpreadsheetState & SpreadsheetActions & HistoryState
 >((set) => ({
   sheets: [initialSheet],
+  past: [],
+  future: [],
+
   activeSheetId: initialSheet.id,
   activeCell: "A1",
+
   selection: {
     start: "A1",
     end: "A1",
@@ -383,28 +398,126 @@ export const useSpreadsheetStore = create<
   setActiveCell: (address) =>
     set({
       activeCell: address,
-      selection: { start: address, end: address },
+      selection: {
+        start: address,
+        end: address,
+      },
     }),
 
   updateCell: (address, raw) =>
-    set((state) => ({
-      sheets: state.sheets.map((sheet) => {
-        if (sheet.id !== state.activeSheetId) return sheet;
+    set((state) => {
+      const activeSheet = state.sheets.find(
+        (sheet) => sheet.id === state.activeSheetId
+      );
 
-        const updatedCells = {
-          ...sheet.cells,
-          [address.toUpperCase()]: {
+      if (!activeSheet) return state;
+
+      const normalizedAddress = address.toUpperCase();
+
+      if (activeSheet.cells[normalizedAddress]?.raw === raw) {
+        return state;
+      }
+
+      const updatedCells = {
+        ...activeSheet.cells,
+        [normalizedAddress]: {
+          raw,
+          value: null,
+        },
+      };
+
+      const updatedSheet: Sheet = {
+        ...activeSheet,
+        cells: calculateCells(updatedCells),
+      };
+
+      return {
+        sheets: state.sheets.map((sheet) =>
+          sheet.id === state.activeSheetId ? updatedSheet : sheet
+        ),
+
+        // Store the previous state for Undo.
+        past: [...state.past, state.sheets],
+
+        // A new edit clears the Redo history.
+        future: [],
+      };
+    }),
+
+  pasteCells: (startAddress, matrix) =>
+    set((state) => {
+      const activeSheet = state.sheets.find(
+        (sheet) => sheet.id === state.activeSheetId
+      );
+      const start = parseCellAddress(startAddress);
+
+      if (!activeSheet || !start || matrix.length === 0) {
+        return state;
+      }
+
+      const updatedCells = { ...activeSheet.cells };
+      let hasChanges = false;
+
+      matrix.forEach((row, rowIndex) => {
+        row.forEach((raw, colIndex) => {
+          const targetRow = start.row + rowIndex;
+          const targetCol = start.column + colIndex;
+
+          if (targetRow > 10000 || targetCol > 16384) return;
+
+          const address = getCellAddress(targetRow, targetCol);
+
+          if (updatedCells[address]?.raw === raw) return;
+
+          updatedCells[address] = {
             raw,
             value: null,
-          },
-        };
+          };
+          hasChanges = true;
+        });
+      });
 
-        return {
-          ...sheet,
-          cells: calculateCells(updatedCells),
-        };
-      }),
-    })),
+      if (!hasChanges) return state;
+
+      const updatedSheet: Sheet = {
+        ...activeSheet,
+        cells: calculateCells(updatedCells),
+      };
+
+      return {
+        sheets: state.sheets.map((sheet) =>
+          sheet.id === state.activeSheetId ? updatedSheet : sheet
+        ),
+        past: [...state.past, state.sheets],
+        future: [],
+      };
+    }),
+
+  undo: () =>
+    set((state) => {
+      if (state.past.length === 0) return state;
+
+      const previousSheets = state.past[state.past.length - 1];
+
+      return {
+        sheets: previousSheets,
+        past: state.past.slice(0, -1),
+        future: [state.sheets, ...state.future],
+      };
+    }),
+
+  redo: () =>
+    set((state) => {
+      if (state.future.length === 0) return state;
+
+      const nextSheets = state.future[0];
+
+      return {
+        sheets: nextSheets,
+        past: [...state.past, state.sheets],
+        future: state.future.slice(1),
+      };
+    }),
 
   addSheet: () =>
     set((state) => {
@@ -421,7 +534,10 @@ export const useSpreadsheetStore = create<
         ],
         activeSheetId: id,
         activeCell: "A1",
-        selection: { start: "A1", end: "A1" },
+        selection: {
+          start: "A1",
+          end: "A1",
+        },
       };
     }),
 
@@ -436,6 +552,9 @@ export const useSpreadsheetStore = create<
     set({
       activeSheetId: id,
       activeCell: "A1",
-      selection: { start: "A1", end: "A1" },
+      selection: {
+        start: "A1",
+        end: "A1",
+      },
     }),
 }));

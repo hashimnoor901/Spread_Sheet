@@ -17,11 +17,18 @@ export default function Spreadsheet() {
   const sheets = useSpreadsheetStore((s) => s.sheets);
   const activeSheetId = useSpreadsheetStore((s) => s.activeSheetId);
   const activeCell = useSpreadsheetStore((s) => s.activeCell);
+  const selection = useSpreadsheetStore((s) => s.selection);
   const setActiveCell = useSpreadsheetStore((s) => s.setActiveCell);
+  const setSelection = useSpreadsheetStore((s) => s.setSelection);
   const updateCell = useSpreadsheetStore((s) => s.updateCell);
+  const pasteCells = useSpreadsheetStore((s) => s.pasteCells);
   const addSheet = useSpreadsheetStore((s) => s.addSheet);
   const setActiveSheet = useSpreadsheetStore((s) => s.setActiveSheet);
   const renameSheet = useSpreadsheetStore((s) => s.renameSheet);
+  const undo = useSpreadsheetStore((s) => s.undo);
+const redo = useSpreadsheetStore((s) => s.redo);
+const canUndo = useSpreadsheetStore((s) => s.past.length > 0);
+const canRedo = useSpreadsheetStore((s) => s.future.length > 0);
 
   const sheet = sheets.find((s) => s.id === activeSheetId)!;
   const activeValue = sheet.cells[activeCell]?.raw ?? "";
@@ -32,19 +39,14 @@ export default function Spreadsheet() {
   const [sheetNameDraft, setSheetNameDraft] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
+  const dragAnchorRef = useRef(activeCell);
+  const isDraggingRef = useRef(false);
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();
   }, [editing]);
 
   const parsedAddress = parseCellAddress(activeCell);
-
-  const selectedNumber = Number(sheet.cells[activeCell]?.value);
-  const hasNumber =
-    sheet.cells[activeCell]?.value !== null &&
-    sheet.cells[activeCell]?.value !== undefined &&
-    sheet.cells[activeCell]?.value !== "" &&
-    Number.isFinite(selectedNumber);
 
   const startEditing = (initial?: string) => {
     setDraft(initial ?? activeValue);
@@ -57,14 +59,93 @@ export default function Spreadsheet() {
     gridRef.current?.focus();
   };
 
-  const moveCell = (rowDelta: number, colDelta: number) => {
+  const moveCell = (
+    rowDelta: number,
+    colDelta: number,
+    extendSelection = false
+  ) => {
     const position = parseCellAddress(activeCell);
     if (!position) return;
 
     const row = Math.max(1, Math.min(10000, position.row + rowDelta));
     const col = Math.max(1, Math.min(16384, position.column + colDelta));
+    const nextAddress = getCellAddress(row, col);
 
-    setActiveCell(getCellAddress(row, col));
+    if (extendSelection) {
+      setSelection(selection.start, nextAddress);
+    } else {
+      setActiveCell(nextAddress);
+    }
+  };
+
+  const handleCellMouseDown = (
+    address: string,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    if (editing) commitEdit();
+
+    const anchor = event.shiftKey ? selection.start : address;
+    dragAnchorRef.current = anchor;
+    isDraggingRef.current = !event.shiftKey;
+
+    if (event.shiftKey) {
+      setSelection(anchor, address);
+    } else {
+      setActiveCell(address);
+    }
+
+    gridRef.current?.focus();
+  };
+
+  const handleCellMouseEnter = (address: string) => {
+    if (isDraggingRef.current) {
+      setSelection(dragAnchorRef.current, address);
+    }
+  };
+
+  const handleGridPaste = (
+    event: React.ClipboardEvent<HTMLDivElement>
+  ) => {
+    if (editing) return;
+
+    event.preventDefault();
+
+    const clipboard = event.clipboardData;
+    const plainText = clipboard.getData("text/plain");
+    let matrix: string[][] = [];
+
+    if (plainText !== "") {
+      const rows = plainText
+        .replace(/\r\n/g, "\n")
+        .replace(/\r/g, "\n")
+        .split("\n");
+
+      if (rows[rows.length - 1] === "") {
+        rows.pop();
+      }
+
+      matrix = rows.map((row) => row.split("\t"));
+    } else {
+      const html = clipboard.getData("text/html");
+
+      if (html) {
+        const parsedDocument = new DOMParser().parseFromString(
+          html,
+          "text/html"
+        );
+
+        matrix = Array.from(parsedDocument.querySelectorAll("tr")).map(
+          (row) =>
+            Array.from(row.querySelectorAll("td, th")).map(
+              (cell) => cell.textContent?.trim() ?? ""
+            )
+        );
+      }
+    }
+
+    if (matrix.length > 0) {
+      pasteCells(activeCell, matrix);
+    }
   };
 
   const handleGridKeyDown = (
@@ -72,18 +153,31 @@ export default function Spreadsheet() {
   ) => {
     if (editing) return;
 
-    if (event.key === "ArrowUp") {
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      event.key.toLowerCase() === "z"
+    ) {
       event.preventDefault();
-      moveCell(-1, 0);
+
+      if (event.shiftKey) {
+        redo();
+      } else {
+        undo();
+      }
+
+      return;
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveCell(-1, 0, event.shiftKey);
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
-      moveCell(1, 0);
+      moveCell(1, 0, event.shiftKey);
     } else if (event.key === "ArrowLeft") {
       event.preventDefault();
-      moveCell(0, -1);
+      moveCell(0, -1, event.shiftKey);
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
-      moveCell(0, 1);
+      moveCell(0, 1, event.shiftKey);
     } else if (event.key === "Tab") {
       event.preventDefault();
       moveCell(0, event.shiftKey ? -1 : 1);
@@ -105,16 +199,39 @@ export default function Spreadsheet() {
     }
   };
 
-  const numericValues = useMemo(() => {
-    return Object.values(sheet.cells)
-      .map((cell) => cell.value)
-      .filter(
-        (value): value is number =>
-          typeof value === "number" && Number.isFinite(value)
-      );
-  }, [sheet.cells]);
+  const selectionStats = useMemo(() => {
+    const start = parseCellAddress(selection.start);
+    const end = parseCellAddress(selection.end);
+    if (!start || !end) return { count: 0, sum: 0, average: 0 };
 
-  const total = numericValues.reduce((sum, value) => sum + value, 0);
+    let count = 0;
+    let sum = 0;
+    let numericCount = 0;
+
+    const minRow = Math.min(start.row, end.row);
+    const maxRow = Math.max(start.row, end.row);
+    const minColumn = Math.min(start.column, end.column);
+    const maxColumn = Math.max(start.column, end.column);
+
+    for (let row = minRow; row <= maxRow; row++) {
+      for (let column = minColumn; column <= maxColumn; column++) {
+        const address = getCellAddress(row, column);
+        const cell = sheet.cells[address];
+        if (!cell || cell.raw.trim() === "") continue;
+        count++;
+        if (typeof cell.value === "number" && Number.isFinite(cell.value)) {
+          sum += cell.value;
+          numericCount++;
+        }
+      }
+    }
+
+    return {
+      count,
+      sum,
+      average: numericCount > 0 ? sum / numericCount : 0,
+    };
+  }, [sheet.cells, selection]);
 
   return (
     <main className="min-h-screen bg-[#f7f8fa] text-[#20242d] dark:bg-[#101319] dark:text-[#edf0f5]">
@@ -191,12 +308,23 @@ export default function Spreadsheet() {
 
         {/* Toolbar */}
         <div className="h-12 px-3 flex items-center gap-1 border-b border-gray-200 dark:border-white/10 overflow-x-auto">
-          <button className="icon-button" title="Undo (coming next)">
-            <Undo2 size={17} />
-          </button>
-          <button className="icon-button" title="Redo (coming next)">
-            <Redo2 size={17} />
-          </button>
+<button
+  className="icon-button"
+  title="Undo (Cmd/Ctrl + Z)"
+  onClick={undo}
+  disabled={!canUndo}
+>
+  <Undo2 size={17} />
+</button>
+
+<button
+  className="icon-button"
+  title="Redo (Cmd/Ctrl + Shift + Z)"
+  onClick={redo}
+  disabled={!canRedo}
+>
+  <Redo2 size={17} />
+</button>
           <div className="toolbar-divider" />
           <button className="icon-button" title="Bold">
             <Bold size={16} />
@@ -245,6 +373,10 @@ export default function Spreadsheet() {
           role="grid"
           aria-label={`${sheet.name} spreadsheet`}
           onKeyDown={handleGridKeyDown}
+          onPaste={handleGridPaste}
+          onMouseUp={() => {
+            isDraggingRef.current = false;
+          }}
           className="spreadsheet-scroll outline-none"
         >
           <div
@@ -281,16 +413,28 @@ export default function Spreadsheet() {
                       role="gridcell"
                       aria-selected={isActive}
                       aria-label={`${address}, ${cell?.value ?? "empty"}`}
-                      onMouseDown={() => {
-                        if (editing) commitEdit();
-                        setActiveCell(address);
-                      }}
+                      onMouseDown={(event) => handleCellMouseDown(address, event)}
+                      onMouseEnter={() => handleCellMouseEnter(address)}
                       onDoubleClick={() => {
+                        isDraggingRef.current = false;
                         setActiveCell(address);
                         startEditing();
                       }}
                       className={`spreadsheet-cell ${
                         isActive ? "active-cell" : ""
+                      } ${
+                        (() => {
+                          const start = parseCellAddress(selection.start);
+                          const end = parseCellAddress(selection.end);
+                          const current = parseCellAddress(address);
+                          if (!start || !end || !current) return "";
+                          const inside =
+                            current.row >= Math.min(start.row, end.row) &&
+                            current.row <= Math.max(start.row, end.row) &&
+                            current.column >= Math.min(start.column, end.column) &&
+                            current.column <= Math.max(start.column, end.column);
+                          return inside && !isActive ? "bg-emerald-100/70 dark:bg-emerald-500/20" : "";
+                        })()
                       }`}
                     >
                       {isEditing ? (
@@ -392,9 +536,9 @@ export default function Spreadsheet() {
               : "Ready"}
           </span>
           <div className="flex items-center gap-4">
-            <span>Count: {hasNumber ? 1 : 0}</span>
-            <span>Sum: {hasNumber ? selectedNumber.toLocaleString() : 0}</span>
-            <span>Average: {hasNumber ? selectedNumber.toLocaleString() : 0}</span>
+            <span>Count: {selectionStats.count}</span>
+            <span>Sum: {selectionStats.sum.toLocaleString()}</span>
+            <span>Average: {selectionStats.average.toLocaleString()}</span>
           </div>
         </div>
       </section>
